@@ -1,0 +1,139 @@
+name: toolchain
+
+# Native m68k-elf GCC + binutils cross toolchain for SGDK, built per platform.
+# Mirrors the validated build flags from sgdk-setup/m68k-setup.sh, but packaged
+# for distribution. The toolchain rarely changes (keyed by GCC/binutils version),
+# so this is built on demand (manual or tag), NOT on every push, and reused across
+# many SGDK releases.
+#
+# GCC's in-tree download_prerequisites links gmp/mpfr/mpc statically, so the
+# resulting m68k-elf-gcc depends only on system libraries -> portable when the
+# whole tree is shipped (GCC resolves cc1/libgcc relative to the binary).
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['gcc*']        # e.g. gcc13.2.0-1
+
+permissions:
+  contents: write
+
+env:
+  GCC_VERSION: "13.2.0"        # matches SGDK's bundled bin/gcc.exe
+  BINUTILS_VERSION: "2.44"
+  GNU_MIRROR: "https://mirrors.ocf.berkeley.edu/gnu"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
+          - { name: macos-arm64,  runner: macos-14,         os: macos }
+          - { name: macos-x86_64, runner: macos-13,         os: macos }   # Intel runner (deprecation risk; revisit if removed)
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -ex
+          if [ "${{ matrix.os }}" = linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential texinfo bison flex wget
+          else
+            brew install gcc@13 texinfo wget    # m68k-setup.sh forces gcc-13 on macOS
+          fi
+
+      - name: Build binutils + gcc (m68k-elf)
+        shell: bash
+        run: |
+          set -ex
+          PREFIX="$RUNNER_TEMP/out/m68k-elf-toolchain"
+          SRC="$RUNNER_TEMP/src"
+          mkdir -p "$SRC" "$PREFIX"
+
+          if [ "${{ matrix.os }}" = macos ]; then
+            export CC=gcc-13 CXX=g++-13
+            JOBS="$(sysctl -n hw.ncpu)"
+          else
+            JOBS="$(nproc)"
+          fi
+
+          cd "$SRC"
+          wget -q "${GNU_MIRROR}/binutils/binutils-${BINUTILS_VERSION}.tar.gz"
+          wget -q "${GNU_MIRROR}/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz"
+          tar xf "binutils-${BINUTILS_VERSION}.tar.gz"
+          tar xf "gcc-${GCC_VERSION}.tar.gz"
+          ( cd "gcc-${GCC_VERSION}" && ./contrib/download_prerequisites )
+
+          # --- binutils ---
+          mkdir build-binutils && cd build-binutils
+          "../binutils-${BINUTILS_VERSION}/configure" \
+            --target=m68k-elf --prefix="$PREFIX" \
+            --disable-nls --disable-werror --without-headers --without-newlib
+          make -j"$JOBS"
+          make install
+          cd ..
+
+          # --- gcc (C only, 68000, freestanding) ---
+          mkdir build-gcc && cd build-gcc
+          "../gcc-${GCC_VERSION}/configure" \
+            --target=m68k-elf --prefix="$PREFIX" \
+            --enable-languages=c --without-headers --without-newlib \
+            --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
+            --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+            --with-cpu=68000
+          make -j"$JOBS" all-gcc
+          make -j"$JOBS" all-target-libgcc
+          make install-gcc
+          make install-target-libgcc
+
+      - name: Strip (Linux only; macOS keeps the valid linker ad-hoc signature)
+        if: ${{ matrix.os == 'linux' }}
+        shell: bash
+        run: |
+          set -ex
+          PREFIX="$RUNNER_TEMP/out/m68k-elf-toolchain"
+          find "$PREFIX" -type f -perm -u+x -exec strip --strip-unneeded {} + 2>/dev/null || true
+          find "$PREFIX" -name '*.a' -exec strip -g {} + 2>/dev/null || true
+
+      - name: Verify toolchain + dependency audit
+        shell: bash
+        run: |
+          set -ex
+          BIN="$RUNNER_TEMP/out/m68k-elf-toolchain/bin"
+          "$BIN/m68k-elf-gcc" --version
+          "$BIN/m68k-elf-gcc" -print-prog-name=cc1
+          echo "=== dependency audit (expect system libs only) ==="
+          if [ "${{ matrix.os }}" = macos ]; then
+            otool -L "$BIN/m68k-elf-gcc"
+          else
+            ldd "$BIN/m68k-elf-gcc" || true
+          fi
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -ex
+          ASSET="m68k-elf-toolchain-gcc${GCC_VERSION}-${{ matrix.name }}.tar.gz"
+          tar czf "$ASSET" -C "$RUNNER_TEMP/out" m68k-elf-toolchain
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-${{ matrix.name }}
+          path: ${{ steps.pkg.outputs.asset }}
+
+      - name: Attach to release (tag push only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.asset }}

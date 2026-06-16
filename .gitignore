@@ -1,0 +1,8 @@
+# build outputs / fetched sources
+*.tar.gz
+*.tar.xz
+*.zip
+/src/
+/out/
+/build-*/
+.DS_Store

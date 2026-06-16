@@ -1,0 +1,133 @@
+name: gdb
+
+# Native m68k-elf GDB, made self-contained for distribution.
+#
+# EXPERIMENTAL: the dependency-bundling steps (dylibbundler / patchelf) need a real
+# CI run to validate. A locally-built gdb links brew (gmp/mpfr/...) and pyenv
+# libpython at absolute paths, so it is NOT portable as-is. Two fixes applied here,
+# the same techniques blastem-builds uses for SDL2:
+#   1. --without-python  -> drops the worst dependency (pyenv libpython)
+#   2. bundle remaining dylibs/so next to the binary + rewrite paths, then re-sign
+#      (modifying a Mach-O invalidates its ad-hoc signature on Apple Silicon)
+#
+# Built independently of the gcc toolchain (gdb only needs gmp/mpfr, not cross-gcc).
+# The user / sgdkx drops m68k-elf-gdb into the toolchain's bin at install time.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['gdb*']        # e.g. gdb16.2-1
+
+permissions:
+  contents: write
+
+env:
+  GDB_VERSION: "16.2"
+  GNU_MIRROR: "https://mirrors.ocf.berkeley.edu/gnu"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
+          - { name: macos-arm64,  runner: macos-14,         os: macos }
+          - { name: macos-x86_64, runner: macos-13,         os: macos }
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -ex
+          if [ "${{ matrix.os }}" = linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential texinfo bison flex wget \
+              libgmp-dev libmpfr-dev libncurses-dev patchelf
+          else
+            brew install gmp mpfr texinfo wget dylibbundler
+          fi
+
+      - name: Build gdb (m68k-elf, --without-python)
+        shell: bash
+        run: |
+          set -ex
+          PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"
+          SRC="$RUNNER_TEMP/src"
+          mkdir -p "$SRC" "$PREFIX"
+
+          if [ "${{ matrix.os }}" = macos ]; then
+            JOBS="$(sysctl -n hw.ncpu)"
+            EXTRA="--with-gmp=$(brew --prefix gmp) --with-mpfr=$(brew --prefix mpfr) --with-system-zlib"
+          else
+            JOBS="$(nproc)"
+            EXTRA=""
+          fi
+
+          cd "$SRC"
+          wget -q "${GNU_MIRROR}/gdb/gdb-${GDB_VERSION}.tar.xz"
+          tar xf "gdb-${GDB_VERSION}.tar.xz"
+          mkdir build-gdb && cd build-gdb
+          "../gdb-${GDB_VERSION}/configure" \
+            --target=m68k-elf --prefix="$PREFIX" \
+            --enable-tui=yes --without-python --disable-source-highlight \
+            $EXTRA
+          make -j"$JOBS"
+          make install
+
+      - name: Bundle dependencies + re-sign (make portable)
+        shell: bash
+        run: |
+          set -ex
+          PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"
+          GDB="$PREFIX/bin/m68k-elf-gdb"
+          if [ "${{ matrix.os }}" = macos ]; then
+            mkdir -p "$PREFIX/lib/bundled"
+            dylibbundler -od -b -x "$GDB" \
+              -d "$PREFIX/lib/bundled" -p '@executable_path/../lib/bundled/' </dev/null
+            # re-sign: install_name rewrites invalidate the ad-hoc signature on arm64
+            codesign --force -s - "$GDB"
+            find "$PREFIX/lib/bundled" -name '*.dylib' -exec codesign --force -s - {} \;
+            echo "=== final deps ==="; otool -L "$GDB"
+          else
+            mkdir -p "$PREFIX/lib/bundled"
+            ldd "$GDB" | awk '/=>/{print $3}' \
+              | grep -E 'libgmp|libmpfr|libmpc|libncurses|libtinfo|libstdc\+\+|libgcc_s' \
+              | while read -r so; do [ -f "$so" ] && cp -Lv "$so" "$PREFIX/lib/bundled/"; done
+            patchelf --set-rpath '$ORIGIN/../lib/bundled' "$GDB"
+            echo "=== final deps ==="; ldd "$GDB" || true
+          fi
+
+      - name: Smoke test (native targets only)
+        if: ${{ matrix.name == 'linux-x86_64' || matrix.name == 'macos-arm64' }}
+        shell: bash
+        run: |
+          set -ex
+          "$RUNNER_TEMP/out/m68k-elf-gdb/bin/m68k-elf-gdb" --version
+          "$RUNNER_TEMP/out/m68k-elf-gdb/bin/m68k-elf-gdb" --batch -ex 'show version'
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -ex
+          ASSET="m68k-elf-gdb-${GDB_VERSION}-${{ matrix.name }}.tar.gz"
+          tar czf "$ASSET" -C "$RUNNER_TEMP/out" m68k-elf-gdb
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdb-${{ matrix.name }}
+          path: ${{ steps.pkg.outputs.asset }}
+
+      - name: Attach to release (tag push only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.asset }}
