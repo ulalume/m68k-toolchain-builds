@@ -92,12 +92,18 @@ jobs:
           cd ..
 
           # --- gcc (C only, 68000, freestanding) ---
+          # --without-zstd: use zlib (not zstd) for LTO bytecode compression on EVERY platform.
+          # The Windows toolchain (mingw cross, no libzstd) can't read zstd LTO, and sgdk-native's
+          # Windows bundle builds libmd.a with THIS (Linux) gcc — so they must use a compression
+          # both support. zlib is universal; the difference is internal only. (LTO-compat is the
+          # real form of the gcc-version-lock invariant.)
           mkdir build-gcc && cd build-gcc
           "../gcc-${GCC_VERSION}/configure" \
             --target=m68k-elf --prefix="$PREFIX" \
             --enable-languages=c --without-headers --without-newlib \
             --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+            --without-zstd \
             --with-cpu=68000
           make -j"$JOBS" all-gcc
           make -j"$JOBS" all-target-libgcc
@@ -152,6 +158,7 @@ jobs:
             --enable-languages=c --without-headers --without-newlib \
             --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+            --without-zstd \
             --with-cpu=68000
           make -j"$JOBS" all-gcc
           make -j"$JOBS" all-target-libgcc
@@ -212,7 +219,7 @@ jobs:
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
             --with-cpu=68000 \
             --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --with-mpc="$MINGW_DEPS" \
-            --without-isl \
+            --without-isl --without-zstd \
             --with-build-time-tools="$LXPREFIX/$TGT/bin" \
             --enable-lto --enable-plugin \
             LDFLAGS="-static-libgcc -static-libstdc++"
