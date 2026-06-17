@@ -179,6 +179,13 @@ jobs:
             --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --disable-shared --enable-static
           make -j"$JOBS"; make install; cd ..
 
+          # Remove the download_prerequisites in-tree symlinks: gcc builds in-tree gmp/mpfr/mpc/isl
+          # whenever those dirs exist, IGNORING --with-gmp, and its in-tree ISL fails to cross-build
+          # to the mingw host (configure-isl Error 1). Removing them makes Phase D honor
+          # --with-gmp/mpfr/mpc=$MINGW_DEPS (Phase B's libs) and --without-isl. Phase A already
+          # consumed these symlinks, so removal now is safe.
+          rm -rf "$GSRC"/gmp "$GSRC"/mpfr "$GSRC"/mpc "$GSRC"/isl
+
           ###############################################################
           # PHASE C: build -> host(mingw) binutils, target m68k-elf
           ###############################################################
@@ -201,6 +208,7 @@ jobs:
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
             --with-cpu=68000 \
             --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --with-mpc="$MINGW_DEPS" \
+            --without-isl \
             --with-build-time-tools="$LXPREFIX/$TGT/bin" \
             --enable-lto --enable-plugin \
             LDFLAGS="-static -static-libgcc -static-libstdc++"
