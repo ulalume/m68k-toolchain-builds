@@ -103,7 +103,7 @@ jobs:
             --enable-languages=c --without-headers --without-newlib \
             --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
-            --without-zstd \
+            --without-zstd --disable-werror \
             --with-cpu=68000
           make -j"$JOBS" all-gcc
           make -j"$JOBS" all-target-libgcc
@@ -158,7 +158,7 @@ jobs:
             --enable-languages=c --without-headers --without-newlib \
             --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
-            --without-zstd \
+            --without-zstd --disable-werror \
             --with-cpu=68000
           make -j"$JOBS" all-gcc
           make -j"$JOBS" all-target-libgcc
@@ -219,7 +219,7 @@ jobs:
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
             --with-cpu=68000 \
             --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --with-mpc="$MINGW_DEPS" \
-            --without-isl --without-zstd \
+            --without-isl --without-zstd --disable-werror \
             --with-build-time-tools="$LXPREFIX/$TGT/bin" \
             --enable-lto --enable-plugin \
             LDFLAGS="-static-libgcc -static-libstdc++"
