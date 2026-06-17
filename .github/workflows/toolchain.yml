@@ -22,6 +22,7 @@ env:
   GCC_VERSION: "13.2.0"        # matches SGDK's bundled bin/gcc.exe
   BINUTILS_VERSION: "2.44"
   GNU_MIRROR: "https://mirrors.ocf.berkeley.edu/gnu"
+  DEBIAN_FRONTEND: "noninteractive"   # apt: never block on a debconf prompt (mingw threading default)
 
 jobs:
   build:
