@@ -201,10 +201,14 @@ jobs:
           #   - static-link host C/C++ runtime to minimize DLLs (closure below catches the rest)
           ###############################################################
           mkdir build-gcc-w && cd build-gcc-w
+          # NOTE: do NOT pass --disable-shared here. It would force the LTO plugin to build as a
+          # static liblto_plugin.a, but ld/nm must dlopen a DLL (--plugin=liblto_plugin.dll).
+          # Phase D builds only all-gcc + the plugin (never target libs), so enabling shared has
+          # no effect on the (static) m68k target libgcc, which comes from Phase A.
           "../gcc-${GCC_VERSION}/configure" \
             --build=x86_64-linux-gnu --host=$HOST --target=$TGT --prefix="$WINPREFIX" \
             --enable-languages=c --without-headers --without-newlib \
-            --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
+            --disable-libstdcxx --disable-threads --disable-libssp \
             --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
             --with-cpu=68000 \
             --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --with-mpc="$MINGW_DEPS" \
