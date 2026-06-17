@@ -215,7 +215,11 @@ jobs:
             --without-isl \
             --with-build-time-tools="$LXPREFIX/$TGT/bin" \
             --enable-lto --enable-plugin \
-            LDFLAGS="-static -static-libgcc -static-libstdc++"
+            LDFLAGS="-static-libgcc -static-libstdc++"
+            # NOTE: no bare `-static` here — it makes libtool build liblto_plugin as a static .a
+            # instead of the required .dll. -static-libgcc/-static-libstdc++ still trim the gcc/g++
+            # runtime DLLs from the host exes; any leftover DLL (e.g. libwinpthread) is gathered by
+            # the transitive-closure step in Phase E.
           make -j"$JOBS" all-gcc
           make install-gcc
           # the LTO linker plugin (liblto_plugin.dll) is a separate top-level module — NOT built
