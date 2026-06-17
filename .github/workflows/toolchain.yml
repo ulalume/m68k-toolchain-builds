@@ -27,22 +27,32 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 180   # windows-cross does two GCC builds serially (Phase A linux + Phase D mingw)
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
-          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
-          - { name: macos-arm64,  runner: macos-14,         os: macos }
-          - { name: macos-x86_64, runner: macos-15-intel,   os: macos }   # Intel runner (macos-13 retired Dec 2025; x86_64 mac support ends Fall 2027)
+          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux }
+          - { name: macos-arm64,    runner: macos-14,         os: macos }
+          - { name: macos-x86_64,   runner: macos-15-intel,   os: macos }   # Intel runner (macos-13 retired Dec 2025; x86_64 mac support ends Fall 2027)
+          - { name: windows-x86_64, runner: ubuntu-latest,    os: windows-cross }   # Windows-hosted toolchain via mingw Canadian cross (BUILD=linux, HOST=mingw, TARGET=m68k-elf)
 
     steps:
       - name: Install build dependencies
         shell: bash
         run: |
           set -ex
-          if [ "${{ matrix.os }}" = linux ]; then
+          if [ "${{ matrix.os }}" = windows-cross ]; then
+            # ubuntu host: native toolchain (for the build->target pass) + mingw cross (for the
+            # host pass) + build-side gmp/mpfr/mpc (-dev) for the Canadian-cross gcc's build-machine
+            # configure probes (the mingw-host copies are built separately in Phase B).
+            sudo apt-get update
+            sudo apt-get install -y build-essential texinfo bison flex wget \
+              gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+              libgmp-dev libmpfr-dev libmpc-dev
+            x86_64-w64-mingw32-gcc --version
+          elif [ "${{ matrix.os }}" = linux ]; then
             sudo apt-get update
             sudo apt-get install -y build-essential texinfo bison flex wget
           else
@@ -50,6 +60,7 @@ jobs:
           fi
 
       - name: Build binutils + gcc (m68k-elf)
+        if: ${{ matrix.os != 'windows-cross' }}
         shell: bash
         run: |
           set -ex
@@ -93,6 +104,186 @@ jobs:
           make install-gcc
           make install-target-libgcc
 
+      # --- Windows-hosted toolchain via mingw Canadian cross (ubuntu runner) ---
+      # A Canadian cross needs a working BUILD->TARGET gcc FIRST (to build the target
+      # libgcc.a — the mingw gcc.exe cannot run on the Linux builder), then the
+      # HOST(mingw)->TARGET gcc. Phases:
+      #   A  build->target  (Linux m68k-elf gcc + libgcc.a) — same flags as the Unix job
+      #   B  build->host    GMP/MPFR/MPC cross-built for the mingw host
+      #   C  build->host    binutils (target m68k-elf)
+      #   D  build->host    gcc (target m68k-elf, all-gcc only; reuse Phase-A libgcc)
+      #   E  flatten to SGDK's bin/+lib/ layout, gather mingw runtime DLLs (transitive
+      #      closure), strip, audit. Result lands in $RUNNER_TEMP/out/m68k-elf-toolchain
+      #      so the shared "Package" step tars it as ...-windows-x86_64.tar.gz.
+      - name: Build Windows-hosted m68k-elf toolchain (Canadian cross)
+        if: ${{ matrix.os == 'windows-cross' }}
+        shell: bash
+        run: |
+          set -ex
+          HOST=x86_64-w64-mingw32
+          TGT=m68k-elf
+          V="${GCC_VERSION}"
+          JOBS="$(nproc)"
+          SRC="$RUNNER_TEMP/src";          mkdir -p "$SRC"
+          LXPREFIX="$RUNNER_TEMP/linux-tc"        # Phase A: Linux-hosted m68k toolchain
+          MINGW_DEPS="$RUNNER_TEMP/mingw-deps"    # Phase B: mingw-hosted gmp/mpfr/mpc
+          WINPREFIX="$RUNNER_TEMP/win-tc"         # Phase C/D: mingw-hosted install (prefix tree)
+          mkdir -p "$LXPREFIX" "$MINGW_DEPS" "$WINPREFIX"
+
+          cd "$SRC"
+          wget -q "${GNU_MIRROR}/binutils/binutils-${BINUTILS_VERSION}.tar.gz"
+          wget -q "${GNU_MIRROR}/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz"
+          tar xf "binutils-${BINUTILS_VERSION}.tar.gz"
+          tar xf "gcc-${GCC_VERSION}.tar.gz"
+          ( cd "gcc-${GCC_VERSION}" && ./contrib/download_prerequisites )   # -> gmp/ mpfr/ mpc/ in gcc tree
+
+          ###############################################################
+          # PHASE A: build -> target (Linux-hosted m68k-elf gcc + libgcc)
+          ###############################################################
+          mkdir build-binutils-lx && cd build-binutils-lx
+          "../binutils-${BINUTILS_VERSION}/configure" \
+            --target=$TGT --prefix="$LXPREFIX" \
+            --disable-nls --disable-werror --without-headers --without-newlib
+          make -j"$JOBS"; make install; cd ..
+
+          mkdir build-gcc-lx && cd build-gcc-lx
+          "../gcc-${GCC_VERSION}/configure" \
+            --target=$TGT --prefix="$LXPREFIX" \
+            --enable-languages=c --without-headers --without-newlib \
+            --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
+            --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+            --with-cpu=68000
+          make -j"$JOBS" all-gcc
+          make -j"$JOBS" all-target-libgcc
+          make install-gcc
+          make install-target-libgcc
+          cd ..
+          export PATH="$LXPREFIX/bin:$PATH"          # m68k-elf-as/ld/gcc now discoverable
+          m68k-elf-gcc --version
+
+          ###############################################################
+          # PHASE B: build -> host(mingw) GMP / MPFR / MPC (static)
+          # download_prerequisites unpacked these as gmp/ mpfr/ mpc/ in the gcc src dir
+          ###############################################################
+          GSRC="$SRC/gcc-${GCC_VERSION}"
+          mkdir build-gmp-w && cd build-gmp-w
+          "$GSRC/gmp/configure"  --build=x86_64-linux-gnu --host=$HOST --prefix="$MINGW_DEPS" \
+            --disable-shared --enable-static
+          make -j"$JOBS"; make install; cd ..
+          mkdir build-mpfr-w && cd build-mpfr-w
+          "$GSRC/mpfr/configure" --build=x86_64-linux-gnu --host=$HOST --prefix="$MINGW_DEPS" \
+            --with-gmp="$MINGW_DEPS" --disable-shared --enable-static
+          make -j"$JOBS"; make install; cd ..
+          mkdir build-mpc-w && cd build-mpc-w
+          "$GSRC/mpc/configure"  --build=x86_64-linux-gnu --host=$HOST --prefix="$MINGW_DEPS" \
+            --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --disable-shared --enable-static
+          make -j"$JOBS"; make install; cd ..
+
+          ###############################################################
+          # PHASE C: build -> host(mingw) binutils, target m68k-elf
+          ###############################################################
+          mkdir build-binutils-w && cd build-binutils-w
+          "../binutils-${BINUTILS_VERSION}/configure" \
+            --build=x86_64-linux-gnu --host=$HOST --target=$TGT --prefix="$WINPREFIX" \
+            --disable-nls --disable-werror --without-headers --without-newlib
+          make -j"$JOBS"; make install; cd ..
+
+          ###############################################################
+          # PHASE D: build -> host(mingw) gcc, target m68k-elf (all-gcc only)
+          #   - mingw gmp/mpfr/mpc from Phase B; target binutils from Phase A
+          #   - static-link host C/C++ runtime to minimize DLLs (closure below catches the rest)
+          ###############################################################
+          mkdir build-gcc-w && cd build-gcc-w
+          "../gcc-${GCC_VERSION}/configure" \
+            --build=x86_64-linux-gnu --host=$HOST --target=$TGT --prefix="$WINPREFIX" \
+            --enable-languages=c --without-headers --without-newlib \
+            --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
+            --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+            --with-cpu=68000 \
+            --with-gmp="$MINGW_DEPS" --with-mpfr="$MINGW_DEPS" --with-mpc="$MINGW_DEPS" \
+            --with-build-time-tools="$LXPREFIX/$TGT/bin" \
+            --enable-lto --enable-plugin \
+            LDFLAGS="-static -static-libgcc -static-libstdc++"
+          make -j"$JOBS" all-gcc
+          make install-gcc
+          # the LTO linker plugin (liblto_plugin.dll) is a separate top-level module — NOT built
+          # by all-gcc/install-gcc. SGDK needs it (common.mk passes --plugin=liblto_plugin.dll to
+          # nm/ld for its -flto build), so build+install it explicitly.
+          make -j"$JOBS" all-lto-plugin
+          make install-lto-plugin
+          cd ..
+
+          ###############################################################
+          # PHASE E: flatten to SGDK layout + gather mingw DLLs (closure) + strip + audit
+          ###############################################################
+          OUT="$RUNNER_TEMP/out/m68k-elf-toolchain"
+          mkdir -p "$OUT/bin" "$OUT/lib"
+          cp "$WINPREFIX/bin/$TGT-gcc.exe" "$OUT/bin/gcc.exe"
+          [ -f "$WINPREFIX/bin/$TGT-cpp.exe" ] && cp "$WINPREFIX/bin/$TGT-cpp.exe" "$OUT/bin/cpp.exe" || true
+          GLIBEXEC="$WINPREFIX/libexec/gcc/$TGT/$V"
+          cp "$GLIBEXEC/cc1.exe"         "$OUT/bin/cc1.exe"
+          cp "$GLIBEXEC/lto1.exe"        "$OUT/bin/lto1.exe"
+          cp "$GLIBEXEC/lto-wrapper.exe" "$OUT/bin/lto-wrapper.exe"
+          # liblto_plugin.dll — REQUIRED (common.mk passes --plugin=liblto_plugin.dll). Installed
+          # under libexec/gcc/... and/or lib/bfd-plugins; find the first match and fail if absent.
+          LTO_PLUGIN="$(find "$WINPREFIX" -name 'liblto_plugin*.dll' 2>/dev/null | head -1)"
+          if [ -n "$LTO_PLUGIN" ]; then
+            cp "$LTO_PLUGIN" "$OUT/bin/liblto_plugin.dll"
+          else
+            echo "ERROR: liblto_plugin.dll not found under $WINPREFIX (LTO would break for SGDK)" >&2
+            exit 1
+          fi
+          # binutils (drop target prefix -> bare names, as common.mk's Windows branch expects)
+          for t in as ld ar nm objcopy objdump ranlib strip; do
+            [ -f "$WINPREFIX/bin/$TGT-$t.exe" ] && cp "$WINPREFIX/bin/$TGT-$t.exe" "$OUT/bin/$t.exe"
+          done
+          # target libgcc.a from Phase A (host-independent m68k object code)
+          cp "$LXPREFIX/lib/gcc/$TGT/$V/libgcc.a" "$OUT/lib/libgcc.a"
+
+          # --- gather mingw runtime DLLs to a fixed point (scan exes AND copied dlls) ---
+          locate_dll() {
+            local p
+            p="$(x86_64-w64-mingw32-gcc -print-file-name="$1" 2>/dev/null)"
+            if [ -f "$p" ]; then echo "$p"; return 0; fi
+            find /usr/lib/gcc/$HOST /usr/$HOST /usr/lib/$HOST 2>/dev/null -name "$1" | head -1
+          }
+          changed=1
+          while [ "$changed" = 1 ]; do
+            changed=0
+            for f in "$OUT/bin/"*; do
+              case "$f" in *.exe|*.dll) ;; *) continue ;; esac
+              for d in $(x86_64-w64-mingw32-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+                case "$d" in
+                  libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                    if [ ! -f "$OUT/bin/$d" ]; then
+                      src="$(locate_dll "$d")"
+                      if [ -n "$src" ] && [ -f "$src" ]; then cp "$src" "$OUT/bin/$d"; changed=1; fi
+                    fi ;;
+                esac
+              done
+            done
+          done
+
+          x86_64-w64-mingw32-strip "$OUT/bin/"*.exe 2>/dev/null || true
+
+          echo "=== file type (must be PE32+) ==="; file "$OUT/bin/gcc.exe"
+          # Audit AND assert: every imported mingw runtime DLL must be bundled in bin/ (a missing
+          # one is a silent launch failure on the user's Windows box — fail here in CI instead).
+          missing=0
+          for f in "$OUT/bin/"*.exe "$OUT/bin/"*.dll; do
+            [ -f "$f" ] || continue
+            echo "-- $(basename "$f") --"
+            for d in $(x86_64-w64-mingw32-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+              echo "   $d"
+              case "$d" in
+                libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                  [ -f "$OUT/bin/$d" ] || { echo "   ERROR: $d imported by $(basename "$f") but not bundled" >&2; missing=1; } ;;
+              esac
+            done
+          done
+          [ "$missing" = 0 ] || { echo "ERROR: required mingw runtime DLL(s) missing from bundle" >&2; exit 1; }
+          ls -lh "$OUT/bin" "$OUT/lib"
+
       - name: Strip (Linux only; macOS keeps the valid linker ad-hoc signature)
         if: ${{ matrix.os == 'linux' }}
         shell: bash
@@ -103,6 +294,7 @@ jobs:
           find "$PREFIX" -name '*.a' -exec strip -g {} + 2>/dev/null || true
 
       - name: Verify toolchain + dependency audit
+        if: ${{ matrix.os != 'windows-cross' }}   # Windows audit (PE32+ / objdump) runs in the build step above
         shell: bash
         run: |
           set -ex
