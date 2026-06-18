@@ -33,8 +33,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux }
-          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux }
+          # Linux: build INSIDE a manylinux2014 container (glibc 2.17) so the binaries run on
+          # old distros (Debian 11/Ubuntu 18.04+/RHEL 7+). The job stays on the ubuntu runner so
+          # node20 actions (upload/attach) work — only the build is wrapped in `docker run`.
+          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux, container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux, container: "quay.io/pypa/manylinux2014_aarch64" }
           - { name: macos-arm64,    runner: macos-14,         os: macos }
           - { name: macos-x86_64,   runner: macos-15-intel,   os: macos }   # Intel runner (macos-13 retired Dec 2025; x86_64 mac support ends Fall 2027)
           - { name: windows-x86_64, runner: ubuntu-latest,    os: windows-cross }   # Windows-hosted toolchain via mingw Canadian cross (BUILD=linux, HOST=mingw, TARGET=m68k-elf)
@@ -53,15 +56,14 @@ jobs:
               gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
               libgmp-dev libmpfr-dev libmpc-dev
             x86_64-w64-mingw32-gcc --version
-          elif [ "${{ matrix.os }}" = linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y build-essential texinfo bison flex wget
-          else
+          elif [ "${{ matrix.os }}" = macos ]; then
             brew install gcc@13 texinfo wget    # m68k-setup.sh forces gcc-13 on macOS
           fi
+          # linux: nothing on the host — the build runs inside the manylinux2014 container
+          # (deps installed there via yum). The runner only needs docker, which is preinstalled.
 
-      - name: Build binutils + gcc (m68k-elf)
-        if: ${{ matrix.os != 'windows-cross' }}
+      - name: Build binutils + gcc (m68k-elf, macOS native)
+        if: ${{ matrix.os == 'macos' }}
         shell: bash
         run: |
           set -ex
@@ -69,12 +71,8 @@ jobs:
           SRC="$RUNNER_TEMP/src"
           mkdir -p "$SRC" "$PREFIX"
 
-          if [ "${{ matrix.os }}" = macos ]; then
-            export CC=gcc-13 CXX=g++-13
-            JOBS="$(sysctl -n hw.ncpu)"
-          else
-            JOBS="$(nproc)"
-          fi
+          export CC=gcc-13 CXX=g++-13   # m68k-setup.sh forces gcc-13 on macOS
+          JOBS="$(sysctl -n hw.ncpu)"
 
           cd "$SRC"
           wget -q "${GNU_MIRROR}/binutils/binutils-${BINUTILS_VERSION}.tar.gz"
@@ -110,6 +108,46 @@ jobs:
           make -j"$JOBS" all-target-libgcc
           make install-gcc
           make install-target-libgcc
+
+      # --- Linux: same build, but INSIDE manylinux2014 (CentOS 7, glibc 2.17) so the binaries
+      # run on old distros. Output lands in $RUNNER_TEMP/out (bind-mounted) for the host Verify/
+      # Package/Upload steps; we chown it back to the runner user at the end. gcc flags MUST match
+      # the macOS step above (same toolchain). ---
+      - name: Build binutils + gcc (m68k-elf, Linux in manylinux2014)
+        if: ${{ matrix.os == 'linux' }}
+        shell: bash
+        run: |
+          set -ex
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/src"
+          docker run --rm \
+            -e GCC_VERSION -e BINUTILS_VERSION -e GNU_MIRROR -e RUNNER_TEMP \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            "${{ matrix.container }}" bash -euxc '
+              yum install -y -q texinfo bison flex wget
+              PREFIX="$RUNNER_TEMP/out/m68k-elf-toolchain"
+              SRC="$RUNNER_TEMP/src"; mkdir -p "$SRC" "$PREFIX"; cd "$SRC"
+              JOBS="$(nproc)"
+              wget -q "${GNU_MIRROR}/binutils/binutils-${BINUTILS_VERSION}.tar.gz"
+              wget -q "${GNU_MIRROR}/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz"
+              tar xf "binutils-${BINUTILS_VERSION}.tar.gz"; tar xf "gcc-${GCC_VERSION}.tar.gz"
+              ( cd "gcc-${GCC_VERSION}" && ./contrib/download_prerequisites )
+              mkdir build-binutils && cd build-binutils
+              "../binutils-${BINUTILS_VERSION}/configure" --target=m68k-elf --prefix="$PREFIX" \
+                --disable-nls --disable-werror --without-headers --without-newlib
+              make -j"$JOBS"; make install; cd ..
+              mkdir build-gcc && cd build-gcc
+              "../gcc-${GCC_VERSION}/configure" --target=m68k-elf --prefix="$PREFIX" \
+                --enable-languages=c --without-headers --without-newlib \
+                --disable-shared --disable-libstdcxx --disable-threads --disable-libssp \
+                --disable-libgomp --disable-libquadmath --disable-libmudflap --disable-nls \
+                --without-zstd --disable-werror --with-cpu=68000
+              make -j"$JOBS" all-gcc; make -j"$JOBS" all-target-libgcc
+              make install-gcc; make install-target-libgcc
+              find "$PREFIX" -type f -perm -u+x -exec strip --strip-unneeded {} + 2>/dev/null || true
+              find "$PREFIX" -name "*.a" -exec strip -g {} + 2>/dev/null || true
+              echo "glibc floor: $(objdump -T "$PREFIX/bin/m68k-elf-gcc" | grep -oE "GLIBC_[0-9.]+" | sort -V | tail -1)"
+              chown -R "$(stat -c "%u:%g" "$RUNNER_TEMP")" "$RUNNER_TEMP/out"
+            '
 
       # --- Windows-hosted toolchain via mingw Canadian cross (ubuntu runner) ---
       # A Canadian cross needs a working BUILD->TARGET gcc FIRST (to build the target
@@ -308,14 +346,7 @@ jobs:
           [ "$missing" = 0 ] || { echo "ERROR: required mingw runtime DLL(s) missing from bundle" >&2; exit 1; }
           ls -lh "$OUT/bin" "$OUT/lib"
 
-      - name: Strip (Linux only; macOS keeps the valid linker ad-hoc signature)
-        if: ${{ matrix.os == 'linux' }}
-        shell: bash
-        run: |
-          set -ex
-          PREFIX="$RUNNER_TEMP/out/m68k-elf-toolchain"
-          find "$PREFIX" -type f -perm -u+x -exec strip --strip-unneeded {} + 2>/dev/null || true
-          find "$PREFIX" -name '*.a' -exec strip -g {} + 2>/dev/null || true
+      # (Linux strips inside the manylinux container; macOS keeps its linker ad-hoc signature.)
 
       - name: Verify toolchain + dependency audit
         if: ${{ matrix.os != 'windows-cross' }}   # Windows audit (PE32+ / objdump) runs in the build step above
