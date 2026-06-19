@@ -2,16 +2,23 @@ name: gdb
 
 # Native m68k-elf GDB, made self-contained for distribution.
 #
-# EXPERIMENTAL: the dependency-bundling steps (dylibbundler / patchelf) need a real
-# CI run to validate. A locally-built gdb links brew (gmp/mpfr/...) and pyenv
-# libpython at absolute paths, so it is NOT portable as-is. Two fixes applied here,
-# the same techniques blastem-builds uses for SDL2:
-#   1. --without-python  -> drops the worst dependency (pyenv libpython)
-#   2. bundle remaining dylibs/so next to the binary + rewrite paths, then re-sign
-#      (modifying a Mach-O invalidates its ad-hoc signature on Apple Silicon)
+# Linux binaries are built INSIDE manylinux2014 (CentOS 7, glibc 2.17) so they run on old
+# distros — same treatment as toolchain.yml. Building on ubuntu-latest (glibc 2.39) would
+# bake a GLIBC_2.38+ floor and refuse to start on Debian 11 / Ubuntu 20.04 / RHEL 7-8. The
+# JOB stays on the ubuntu runner (so node20 upload/attach actions work — they need glibc
+# 2.28+, broken inside the old container); only the build+bundle is wrapped in `docker run`.
+#
+# gdb links gmp/mpfr/ncurses (and libstdc++/libgcc_s) at runtime, so we bundle those next to
+# the binary and rewrite the lookup path — the same technique blastem-builds uses for SDL2:
+#   macOS: dylibbundler + @executable_path rpath, then re-sign (an install_name rewrite
+#          invalidates the ad-hoc signature on Apple Silicon).
+#   Linux: copy the deps from the manylinux container + patchelf --set-rpath '$ORIGIN/..'.
+# --without-python drops the worst dependency (a pyenv libpython at an absolute path).
 #
 # Built independently of the gcc toolchain (gdb only needs gmp/mpfr, not cross-gcc).
 # The user / sgdkx drops m68k-elf-gdb into the toolchain's bin at install time.
+#
+# No Windows target: upstream SGDK already ships a gdb.exe in its Windows bundle's bin/.
 
 on:
   workflow_dispatch:
@@ -34,39 +41,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
-          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
+          # Linux: build INSIDE manylinux2014 (glibc 2.17). The JOB runs on the ubuntu runner;
+          # only the build+bundle is wrapped in `docker run` (node20 upload/attach need a newer
+          # glibc than the container has).
+          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux, container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux, container: "quay.io/pypa/manylinux2014_aarch64" }
           - { name: macos-arm64,  runner: macos-14,         os: macos }
           - { name: macos-x86_64, runner: macos-15-intel,   os: macos }   # macos-13 retired Dec 2025
 
     steps:
-      - name: Install build dependencies
+      - name: Install build dependencies (macOS)
+        if: ${{ matrix.os == 'macos' }}
         shell: bash
         run: |
           set -ex
-          if [ "${{ matrix.os }}" = linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y build-essential texinfo bison flex wget \
-              libgmp-dev libmpfr-dev libncurses-dev patchelf
-          else
-            brew install gmp mpfr texinfo wget dylibbundler
-          fi
+          brew install gmp mpfr texinfo wget dylibbundler
+          # linux: deps install inside the manylinux2014 container (yum), not on the host
 
-      - name: Build gdb (m68k-elf, --without-python)
+      - name: Build gdb + bundle (macOS native)
+        if: ${{ matrix.os == 'macos' }}
         shell: bash
         run: |
           set -ex
           PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"
           SRC="$RUNNER_TEMP/src"
           mkdir -p "$SRC" "$PREFIX"
-
-          if [ "${{ matrix.os }}" = macos ]; then
-            JOBS="$(sysctl -n hw.ncpu)"
-            EXTRA="--with-gmp=$(brew --prefix gmp) --with-mpfr=$(brew --prefix mpfr) --with-system-zlib"
-          else
-            JOBS="$(nproc)"
-            EXTRA=""
-          fi
+          JOBS="$(sysctl -n hw.ncpu)"
+          EXTRA="--with-gmp=$(brew --prefix gmp) --with-mpfr=$(brew --prefix mpfr) --with-system-zlib"
 
           cd "$SRC"
           wget -q "${GNU_MIRROR}/gdb/gdb-${GDB_VERSION}.tar.xz"
@@ -79,28 +80,52 @@ jobs:
           make -j"$JOBS"
           make install
 
-      - name: Bundle dependencies + re-sign (make portable)
+          # make portable: bundle linked dylibs next to the binary + rewrite paths, then re-sign
+          GDB="$PREFIX/bin/m68k-elf-gdb"
+          mkdir -p "$PREFIX/lib/bundled"
+          dylibbundler -od -b -x "$GDB" \
+            -d "$PREFIX/lib/bundled" -p '@executable_path/../lib/bundled/' </dev/null
+          codesign --force -s - "$GDB"
+          find "$PREFIX/lib/bundled" -name '*.dylib' -exec codesign --force -s - {} \;
+          echo "=== final deps ==="; otool -L "$GDB"
+
+      # --- Linux: same build, but INSIDE manylinux2014 (CentOS 7, glibc 2.17). Output lands in
+      # $RUNNER_TEMP/out (bind-mounted) for the host Smoke/Package/Upload steps; chowned back to
+      # the runner user at the end. patchelf is preinstalled in the manylinux image. ---
+      - name: Build gdb + bundle (Linux in manylinux2014)
+        if: ${{ matrix.os == 'linux' }}
         shell: bash
         run: |
           set -ex
-          PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"
-          GDB="$PREFIX/bin/m68k-elf-gdb"
-          if [ "${{ matrix.os }}" = macos ]; then
-            mkdir -p "$PREFIX/lib/bundled"
-            dylibbundler -od -b -x "$GDB" \
-              -d "$PREFIX/lib/bundled" -p '@executable_path/../lib/bundled/' </dev/null
-            # re-sign: install_name rewrites invalidate the ad-hoc signature on arm64
-            codesign --force -s - "$GDB"
-            find "$PREFIX/lib/bundled" -name '*.dylib' -exec codesign --force -s - {} \;
-            echo "=== final deps ==="; otool -L "$GDB"
-          else
-            mkdir -p "$PREFIX/lib/bundled"
-            ldd "$GDB" | awk '/=>/{print $3}' \
-              | grep -E 'libgmp|libmpfr|libmpc|libncurses|libtinfo|libstdc\+\+|libgcc_s' \
-              | while read -r so; do [ -f "$so" ] && cp -Lv "$so" "$PREFIX/lib/bundled/"; done
-            patchelf --set-rpath '$ORIGIN/../lib/bundled' "$GDB"
-            echo "=== final deps ==="; ldd "$GDB" || true
-          fi
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/src"
+          docker run --rm \
+            -e GDB_VERSION -e GNU_MIRROR -e RUNNER_TEMP \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            "${{ matrix.container }}" bash -euxc '
+              yum install -y -q gmp-devel mpfr-devel ncurses-devel texinfo bison flex wget xz
+              PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"
+              SRC="$RUNNER_TEMP/src"; mkdir -p "$SRC" "$PREFIX"; cd "$SRC"
+              JOBS="$(nproc)"
+              wget -q "${GNU_MIRROR}/gdb/gdb-${GDB_VERSION}.tar.xz"
+              tar xf "gdb-${GDB_VERSION}.tar.xz"
+              mkdir build-gdb && cd build-gdb
+              "../gdb-${GDB_VERSION}/configure" \
+                --target=m68k-elf --prefix="$PREFIX" \
+                --enable-tui=yes --without-python --disable-source-highlight
+              make -j"$JOBS"
+              make install
+              # make portable: bundle gmp/mpfr/ncurses/libstdc++/libgcc_s from the container + rpath
+              GDB="$PREFIX/bin/m68k-elf-gdb"
+              mkdir -p "$PREFIX/lib/bundled"
+              ldd "$GDB" | awk "/=>/{print \$3}" \
+                | grep -E "libgmp|libmpfr|libmpc|libncurses|libtinfo|libstdc|libgcc_s" \
+                | while read -r so; do [ -f "$so" ] && cp -Lv "$so" "$PREFIX/lib/bundled/"; done
+              patchelf --set-rpath "\$ORIGIN/../lib/bundled" "$GDB"
+              strip --strip-unneeded "$GDB" 2>/dev/null || true
+              echo "glibc floor: $(objdump -T "$GDB" | grep -oE "GLIBC_[0-9.]+" | sort -V | tail -1)"
+              echo "=== final deps ==="; ldd "$GDB" || true
+              chown -R "$(stat -c "%u:%g" "$RUNNER_TEMP")" "$RUNNER_TEMP/out"
+            '
 
       - name: Smoke test (native targets only)
         if: ${{ matrix.name == 'linux-x86_64' || matrix.name == 'macos-arm64' }}
