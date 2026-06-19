@@ -16,9 +16,13 @@ name: gdb
 # --without-python drops the worst dependency (a pyenv libpython at an absolute path).
 #
 # Built independently of the gcc toolchain (gdb only needs gmp/mpfr, not cross-gcc).
-# The user / sgdkx drops m68k-elf-gdb into the toolchain's bin at install time.
+# sgdkx downloads m68k-elf-gdb per platform and runs it via `sgdkx gdb` (it is NOT a build
+# tool — the makefile never invokes it — so it is a standalone download on every OS, including
+# Windows, rather than being baked into the SGDK bundle the way the gcc toolchain must be).
 #
-# No Windows target: upstream SGDK already ships a gdb.exe in its Windows bundle's bin/.
+# Windows is a mingw Canadian cross (BUILD=linux, HOST=x86_64-w64-mingw32, TARGET=m68k-elf),
+# mirroring toolchain.yml: build mingw-hosted gmp/mpfr (static) first, then gdb against them,
+# static-link the mingw C/C++ runtime, and gather any leftover runtime DLL next to the .exe.
 
 on:
   workflow_dispatch:
@@ -30,6 +34,10 @@ permissions:
 
 env:
   GDB_VERSION: "16.2"
+  # mingw-host gmp/mpfr for the Windows cross (match gcc 13.2.0's download_prerequisites versions,
+  # already proven to cross-build to the mingw host in toolchain.yml).
+  GMP_VERSION: "6.2.1"
+  MPFR_VERSION: "4.1.0"
   GNU_MIRROR: "https://mirrors.ocf.berkeley.edu/gnu"
 
 jobs:
@@ -48,6 +56,7 @@ jobs:
           - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux, container: "quay.io/pypa/manylinux2014_aarch64" }
           - { name: macos-arm64,  runner: macos-14,         os: macos }
           - { name: macos-x86_64, runner: macos-15-intel,   os: macos }   # macos-13 retired Dec 2025
+          - { name: windows-x86_64, runner: ubuntu-latest,  os: windows-cross }   # mingw Canadian cross
 
     steps:
       - name: Install build dependencies (macOS)
@@ -57,6 +66,18 @@ jobs:
           set -ex
           brew install gmp mpfr texinfo wget dylibbundler
           # linux: deps install inside the manylinux2014 container (yum), not on the host
+
+      - name: Install build dependencies (Windows cross)
+        if: ${{ matrix.os == 'windows-cross' }}
+        shell: bash
+        run: |
+          set -ex
+          sudo apt-get update
+          # mingw cross (host pass) + build-side toolchain & gmp/mpfr (-dev) for configure probes
+          sudo apt-get install -y build-essential texinfo bison flex wget xz-utils \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+            libgmp-dev libmpfr-dev
+          x86_64-w64-mingw32-gcc --version
 
       - name: Build gdb + bundle (macOS native)
         if: ${{ matrix.os == 'macos' }}
@@ -126,6 +147,94 @@ jobs:
               echo "=== final deps ==="; ldd "$GDB" || true
               chown -R "$(stat -c "%u:%g" "$RUNNER_TEMP")" "$RUNNER_TEMP/out"
             '
+
+      # --- Windows: mingw Canadian cross (BUILD=linux, HOST=mingw, TARGET=m68k-elf). Build
+      # mingw-hosted gmp+mpfr (static) first, then gdb against them; static-link the mingw
+      # C/C++ runtime and gather any leftover runtime DLL next to the .exe. Installs into
+      # $RUNNER_TEMP/out/m68k-elf-gdb so the shared Package step tars it like the others. ---
+      - name: Build gdb + bundle (Windows cross)
+        if: ${{ matrix.os == 'windows-cross' }}
+        shell: bash
+        run: |
+          set -ex
+          HOST=x86_64-w64-mingw32
+          TGT=m68k-elf
+          JOBS="$(nproc)"
+          SRC="$RUNNER_TEMP/src";              mkdir -p "$SRC"
+          DEPS="$RUNNER_TEMP/mingw-deps";      mkdir -p "$DEPS"
+          PREFIX="$RUNNER_TEMP/out/m68k-elf-gdb"; mkdir -p "$PREFIX"
+
+          cd "$SRC"
+          wget -q "${GNU_MIRROR}/gmp/gmp-${GMP_VERSION}.tar.xz"
+          wget -q "${GNU_MIRROR}/mpfr/mpfr-${MPFR_VERSION}.tar.xz"
+          wget -q "${GNU_MIRROR}/gdb/gdb-${GDB_VERSION}.tar.xz"
+          tar xf "gmp-${GMP_VERSION}.tar.xz"
+          tar xf "mpfr-${MPFR_VERSION}.tar.xz"
+          tar xf "gdb-${GDB_VERSION}.tar.xz"
+
+          # mingw-hosted gmp + mpfr (static) — gdb requires gmp; mpfr improves it
+          mkdir build-gmp && cd build-gmp
+          "../gmp-${GMP_VERSION}/configure" --build=x86_64-linux-gnu --host=$HOST \
+            --prefix="$DEPS" --disable-shared --enable-static
+          make -j"$JOBS"; make install; cd ..
+          mkdir build-mpfr && cd build-mpfr
+          "../mpfr-${MPFR_VERSION}/configure" --build=x86_64-linux-gnu --host=$HOST \
+            --prefix="$DEPS" --with-gmp="$DEPS" --disable-shared --enable-static
+          make -j"$JOBS"; make install; cd ..
+
+          # gdb (mingw host, m68k target). --disable-tui: no curses for the mingw host.
+          mkdir build-gdb && cd build-gdb
+          "../gdb-${GDB_VERSION}/configure" \
+            --build=x86_64-linux-gnu --host=$HOST --target=$TGT --prefix="$PREFIX" \
+            --with-gmp="$DEPS" --with-mpfr="$DEPS" \
+            --without-python --disable-tui --disable-source-highlight \
+            LDFLAGS="-static -static-libgcc -static-libstdc++"
+          make -j"$JOBS"
+          make install
+          cd ..
+
+          # self-contained .exe: -static should fold in libgcc/libstdc++/winpthread, but gather
+          # any mingw runtime DLL still imported (transitive closure), placed next to the .exe.
+          locate_dll() {
+            local p; p="$($HOST-gcc -print-file-name="$1" 2>/dev/null)"
+            if [ -f "$p" ]; then echo "$p"; return 0; fi
+            find /usr/lib/gcc/$HOST /usr/$HOST /usr/lib/$HOST 2>/dev/null -name "$1" | head -1
+          }
+          changed=1
+          while [ "$changed" = 1 ]; do
+            changed=0
+            for f in "$PREFIX/bin/"*.exe "$PREFIX/bin/"*.dll; do
+              [ -f "$f" ] || continue
+              for d in $($HOST-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+                case "$d" in
+                  libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                    if [ ! -f "$PREFIX/bin/$d" ]; then
+                      src="$(locate_dll "$d")"
+                      if [ -n "$src" ] && [ -f "$src" ]; then cp "$src" "$PREFIX/bin/$d"; changed=1; fi
+                    fi ;;
+                esac
+              done
+            done
+          done
+          $HOST-strip "$PREFIX/bin/"*.exe 2>/dev/null || true
+
+          echo "=== file type (must be PE32+) ==="; file "$PREFIX/bin/$TGT-gdb.exe"
+          # assert every imported mingw runtime DLL is bundled (a missing one is a silent launch
+          # failure on the user's Windows box — fail here in CI instead).
+          missing=0
+          for f in "$PREFIX/bin/"*.exe "$PREFIX/bin/"*.dll; do
+            [ -f "$f" ] || continue
+            echo "-- $(basename "$f") --"
+            for d in $($HOST-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+              echo "   $d"
+              case "$d" in
+                libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                  [ -f "$PREFIX/bin/$d" ] || { echo "   ERROR: $d not bundled" >&2; missing=1; } ;;
+              esac
+            done
+          done
+          [ "$missing" = 0 ] || { echo "ERROR: required mingw runtime DLL(s) missing" >&2; exit 1; }
+          ls -lh "$PREFIX/bin"
 
       - name: Smoke test (native targets only)
         if: ${{ matrix.name == 'linux-x86_64' || matrix.name == 'macos-arm64' }}
